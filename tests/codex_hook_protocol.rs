@@ -100,6 +100,21 @@ impl HookOutcome {
         serde_json::from_str(s.trim())
             .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\n{self}"))
     }
+
+    /// Extract the user-visible allow-once code from Codex's documented
+    /// `permissionDecisionReason` field.
+    pub fn allow_once_code(&self) -> Option<String> {
+        let json = serde_json::from_slice::<serde_json::Value>(&self.stdout).ok()?;
+        json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Allow-once code:")
+                    .map(str::trim)
+                    .filter(|code| !code.is_empty())
+                    .map(String::from)
+            })
+    }
 }
 
 impl fmt::Display for HookOutcome {
@@ -2119,9 +2134,10 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 // ===========================================================================
 // P2.11 — Allow-once round-trip under Codex
 //
-// Under Codex, the model-visible stderr denial must not expose allow-once
-// tokens. The pending store still records the generated code so a human or
-// harness can redeem it explicitly, then retry — the command must pass.
+// Under Codex, the minimal JSON denial exposes the allow-once code inside the
+// documented permissionDecisionReason string. It must not add unknown JSON
+// fields or expose bypass details on stderr. A human or harness can redeem the
+// visible code explicitly, then retry — the command must pass.
 // ===========================================================================
 
 /// Extract the allow-once short_code from the pending_exceptions.jsonl
@@ -2209,6 +2225,11 @@ fn codex_deny_creates_pending_exception_with_code() {
 
     assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
 
+    let visible_code = outcome.allow_once_code();
+    assert!(
+        visible_code.is_some(),
+        "Codex denial reason must expose the allow-once code\n{outcome}"
+    );
     let code = extract_allow_once_code_from_pending_store(&home_path);
     assert!(
         code.is_some(),
@@ -2218,6 +2239,10 @@ fn codex_deny_creates_pending_exception_with_code() {
         code.as_ref().unwrap().len() >= 5,
         "short_code must be >= 5 chars, got {:?}\n{outcome}",
         code
+    );
+    assert_eq!(
+        visible_code, code,
+        "Codex denial must show the same code recorded in the pending store\n{outcome}"
     );
 }
 
@@ -2263,9 +2288,10 @@ fn codex_allow_once_round_trip() {
         "initial Codex deny expected\n{deny_outcome}"
     );
 
-    // Extract the allow-once code from the pending store
-    let allow_code = extract_allow_once_code_from_pending_store(&home_path)
-        .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
+    // Extract the code from the denial message exactly as the user would.
+    let allow_code = deny_outcome.allow_once_code().unwrap_or_else(|| {
+        panic!("Codex denial reason must contain the allow-once code\n{deny_outcome}")
+    });
 
     // Step 2: Redeem the allow-once code
     let mut redeem_cmd = Command::new(dcg_binary());
@@ -2273,6 +2299,7 @@ fn codex_allow_once_round_trip() {
         .arg("allow-once")
         .arg(&allow_code)
         .arg("--yes")
+        .arg("--single-use")
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)

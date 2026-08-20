@@ -2029,6 +2029,17 @@ pub fn write_denial_to(
             // Extra dcg metadata is intentionally omitted because Codex's
             // parser is stricter than Claude's.  Exit remains 0; some current
             // Codex builds classify exit 2 as hook failure and then fail open.
+            // Keep allow-once details inside the documented reason string so
+            // the operator can redeem the code without exposing unknown JSON
+            // fields or requiring the agent to inspect dcg's state files.
+            let message = if let Some(info) = allow_once {
+                format!(
+                    "{message}\n\nAllow-once code: {}\nUser-only command: dcg allow-once {} --single-use\nDo not run this allowance command yourself. Wait for the user to run it and explicitly tell you to continue.",
+                    info.code, info.code
+                )
+            } else {
+                message
+            };
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
@@ -4809,7 +4820,12 @@ mod tests {
         assert!(
             specific["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("git reset --hard HEAD~1"))
+                .is_some_and(|reason| {
+                    reason.contains("git reset --hard HEAD~1")
+                        && reason.contains("Allow-once code: abc123")
+                        && reason.contains("dcg allow-once abc123 --single-use")
+                        && reason.contains("Do not run this allowance command yourself")
+                })
         );
         assert_eq!(
             specific.as_object().map(serde_json::Map::len),

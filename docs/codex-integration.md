@@ -53,10 +53,16 @@ therefore emits only Codex's documented fields:
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Destructive command blocked by dcg."
+    "permissionDecisionReason": "Destructive command blocked by dcg.\n\nAllow-once code: a1b2c3\nUser-only command: dcg allow-once a1b2c3 --single-use\nDo not run this allowance command yourself. Wait for the user to run it and explicitly tell you to continue."
   }
 }
 ```
+
+The allow-once code is text inside the documented
+`permissionDecisionReason`; it is not an additional JSON field. This keeps the
+strict three-field Codex schema while letting the operator redeem the code
+without opening dcg's pending-exception state. Codex must show the command to
+the user and wait; it must not redeem the exception itself.
 
 The process exits 0. stderr still contains the human-readable warning for an
 operator, but Codex's blocking decision comes from the JSON on stdout. This is
@@ -155,6 +161,8 @@ Claude-compatible path. Only the final hook output contract changes. Check:
 - the project/user/system allowlist file being edited is the one dcg loads;
 - the pending exception store is under the same home/project context that the
   hook process sees;
+- a denial's `permissionDecisionReason` contains `Allow-once code:` and the
+  user-only `dcg allow-once <code> --single-use` command;
 - `tests/codex_hook_protocol.rs` still passes the allowlist and allow-once
   round-trip tests.
 

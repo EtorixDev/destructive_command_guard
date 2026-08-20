@@ -2434,15 +2434,15 @@ configure_codex() {
   # standard hookSpecificOutput here -- the extra fields (allowOnceCode,
   # ruleId, severity, remediation) cause the parser to fail and codex marks
   # the hook as Failed rather than Blocked, letting the destructive command
-  # through.
+  # through. dcg keeps the strict three-field shape and embeds the allow-once
+  # code and user-only redemption command in permissionDecisionReason instead.
   #
   # dcg disambiguates Codex from Claude Code via the `turn_id` stdin field
   # (codex-rs/hooks/src/schema.rs documents it as "Codex extension"; Claude
   # Code does not send it -- and `tool_use_id` is NOT a usable signal here
   # because Claude Code's PreToolUse stdin includes it too). On Codex
-  # payloads dcg switches to codex's documented alternative
-  # (codex-rs/hooks/src/events/pre_tool_use.rs): exit code 2 with the deny
-  # reason on stderr. The hook config below is therefore unchanged from the
+  # payloads dcg emits Codex's documented minimal hookSpecificOutput denial on
+  # stdout and exits 0. The hook config below is therefore unchanged from the
   # Claude Code shape -- the protocol switch is handled inside dcg.
   #
   # Note: The model can still work around this by writing its own script to
