@@ -2033,10 +2033,7 @@ pub fn write_denial_to(
             // the operator can redeem the code without exposing unknown JSON
             // fields or requiring the agent to inspect dcg's state files.
             let message = if let Some(info) = allow_once {
-                format!(
-                    "{message}\n\nAllow-once code: {}\nUser-only command: dcg allow-once {} --single-use\nDo not run this allowance command yourself. Wait for the user to run it and explicitly tell you to continue.",
-                    info.code, info.code
-                )
+                format!("{message}\n\nAllow-once code: {}", info.code)
             } else {
                 message
             };
@@ -4823,8 +4820,6 @@ mod tests {
                 .is_some_and(|reason| {
                     reason.contains("git reset --hard HEAD~1")
                         && reason.contains("Allow-once code: abc123")
-                        && reason.contains("dcg allow-once abc123 --single-use")
-                        && reason.contains("Do not run this allowance command yourself")
                 })
         );
         assert_eq!(

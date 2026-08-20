@@ -2435,7 +2435,7 @@ configure_codex() {
   # ruleId, severity, remediation) cause the parser to fail and codex marks
   # the hook as Failed rather than Blocked, letting the destructive command
   # through. dcg keeps the strict three-field shape and embeds the allow-once
-  # code and user-only redemption command in permissionDecisionReason instead.
+  # code in permissionDecisionReason instead.
   #
   # dcg disambiguates Codex from Claude Code via the `turn_id` stdin field
   # (codex-rs/hooks/src/schema.rs documents it as "Codex extension"; Claude
