@@ -1583,11 +1583,36 @@ pub fn configure_colors() {
     }
 }
 
+/// Cap on the command text echoed back into a block message.
+///
+/// The block message becomes the hook's `permissionDecisionReason`, which
+/// lands in an agent's context and is replayed on every later turn. Echoing
+/// the command verbatim made the refusal grow with the payload — a 10 KB
+/// heredoc write cost ~10.8 KB to report a one-line verdict, and a 50 KB one
+/// cost ~50.8 KB (#339). The stderr box has always been a constant size; this
+/// gives the JSON reason the same property. The cap is generous enough that
+/// ordinary commands are untouched and stay copy-pasteable.
+const MAX_EXPLAIN_HINT_COMMAND: usize = 400;
+
 /// Format the explain hint line for copy-paste convenience.
 fn format_explain_hint(command: &str) -> String {
     // Escape double quotes in command for safe copy-paste
     let escaped = command.replace('"', "\\\"");
-    format!("Tip: dcg explain \"{escaped}\"")
+    if escaped.len() <= MAX_EXPLAIN_HINT_COMMAND {
+        return format!("Tip: dcg explain \"{escaped}\"");
+    }
+
+    // Past the cap the tip cannot be copy-pasteable anyway, so spend the
+    // bytes on the head of the command and say how much was dropped. The
+    // elided byte count is the useful signal here, not the elided bytes.
+    let head = truncate_for_display(&escaped, MAX_EXPLAIN_HINT_COMMAND);
+    let total = command.len();
+    let elided = total.saturating_sub(MAX_EXPLAIN_HINT_COMMAND);
+    format!(
+        "Tip: dcg explain \"{head}\"\n\
+         (command truncated for this report: {elided} of {total} bytes elided; \
+         rerun `dcg explain` against the full command for the complete report)"
+    )
 }
 
 fn build_rule_id(pack: Option<&str>, pattern: Option<&str>) -> Option<String> {
@@ -1640,6 +1665,14 @@ fn format_explanation_block(explanation: &str) -> String {
 }
 
 /// Format the denial message for the JSON output (plain text).
+///
+/// When an allow-once code was minted for this denial, the message names the
+/// scoped `dcg allow-once <code>` remedy (GH#332): harnesses commonly surface
+/// only `permissionDecisionReason` to the model and drop the sibling JSON
+/// fields, so a code that appears only in `allowOnceCode`/`remediation` is
+/// emitted but never read. The wording keeps the human in the loop: the user
+/// approves the single command, which is strictly safer than the fallback of
+/// having them run the destructive command by hand.
 #[must_use]
 pub fn format_denial_message(
     command: &str,
@@ -1647,8 +1680,9 @@ pub fn format_denial_message(
     explanation: Option<&str>,
     pack: Option<&str>,
     pattern: Option<&str>,
+    allow_once_code: Option<&str>,
 ) -> String {
-    format_matched_message(
+    let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,
         reason,
@@ -1656,7 +1690,15 @@ pub fn format_denial_message(
         pack,
         pattern,
         "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-    )
+    );
+    if let Some(code) = allow_once_code {
+        use std::fmt::Write as _;
+        let _ = write!(
+            message,
+            "\n\nTo permit this single command once, the user can approve it with: dcg allow-once {code}"
+        );
+    }
+    message
 }
 
 /// Format a native-review request for a matched destructive command.
@@ -1805,6 +1847,12 @@ pub(crate) fn print_colorful_warning_to(
         WarningAudience::HumanOperator => {
             let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
+
+            // Advertise the scoped single-command remedy ahead of the
+            // persistent allowlist widening (GH#332).
+            if let Some(code) = allow_once_code {
+                let _ = writeln!(writer, "  $ {cyan}dcg allow-once {code}{reset}");
+            }
 
             if let Some(ref rule) = rule_id {
                 let _ = writeln!(writer, "  $ {cyan}dcg allowlist add {rule} --user{reset}");
@@ -1993,7 +2041,23 @@ pub fn write_denial_to(
         warning_audience,
     );
 
-    let message = format_denial_message(command, reason, explanation, pack, pattern);
+    // GH#332: name the allow-once remedy in the reason text for protocols
+    // whose JSON already carries the code. Codex is excluded on purpose — its
+    // output deliberately strips all allow-once metadata (see the Codex arm
+    // below and `WarningAudience::CodexModel`), and the reason string must
+    // not reintroduce what the protocol's design withholds.
+    let reason_allow_once_code = match protocol {
+        HookProtocol::Codex => None,
+        _ => allow_once_code,
+    };
+    let message = format_denial_message(
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        reason_allow_once_code,
+    );
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -2388,17 +2452,34 @@ pub fn write_indeterminate_to(
     stderr: &mut impl Write,
     protocol: HookProtocol,
     reason: &str,
+    deny: bool,
 ) {
     let _ = writeln!(stderr);
     let _ = writeln!(stderr, "{} {reason}", "dcg INDETERMINATE:".yellow().bold());
+
+    // `ask` presumes a human is present to answer. On an unattended session
+    // that prompt either stalls forever or gets waved through by an
+    // auto-approver — for exactly the commands dcg declined to inspect — so
+    // `general.unverified_decision = "deny"` downgrades the review-capable
+    // protocols to an outright denial (#338). Protocols without a native
+    // `ask` decision already block below regardless of this setting.
+    let review_decision = if deny { "deny" } else { "ask" };
+    let review_reason: Cow<'_, str> = if deny {
+        Cow::Owned(format!(
+            "{reason} Denied without review because unverified commands are configured to deny \
+             (general.unverified_decision)."
+        ))
+    } else {
+        Cow::Borrowed(reason)
+    };
 
     match protocol {
         HookProtocol::ClaudeCompatible => {
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
-                    permission_decision: "ask",
-                    permission_decision_reason: Cow::Borrowed(reason),
+                    permission_decision: review_decision,
+                    permission_decision_reason: review_reason,
                     allow_once_code: None,
                     allow_once_full_hash: None,
                     rule_id: None,
@@ -2413,8 +2494,8 @@ pub fn write_indeterminate_to(
         }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
-                permission_decision: "ask",
-                permission_decision_reason: Cow::Borrowed(reason),
+                permission_decision: review_decision,
+                permission_decision_reason: review_reason,
             };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -2517,12 +2598,12 @@ pub fn write_indeterminate_to(
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.
 #[cold]
 #[inline(never)]
-pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str) {
+pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str, deny: bool) {
     let out = io::stdout();
     let mut out_handle = out.lock();
     let err = io::stderr();
     let mut err_handle = err.lock();
-    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason);
+    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason, deny);
 }
 
 /// Write a warning response to arbitrary stdout/stderr writers (test seam).
@@ -3606,12 +3687,99 @@ mod tests {
             Some("This is irreversible."),
             Some("core.git"),
             Some("reset-hard"),
+            None,
         );
 
         assert!(message.contains("Reason: destructive"));
         assert!(message.contains("Explanation: This is irreversible."));
         assert!(message.contains("Rule: core.git:reset-hard"));
         assert!(message.contains("Tip: dcg explain"));
+    }
+
+    /// #339: the block message becomes `permissionDecisionReason`, so it must
+    /// not grow with the payload it is reporting on. An ordinary command is
+    /// still echoed whole; an oversize one is capped and says what it dropped.
+    #[test]
+    fn denial_message_does_not_grow_with_command_length() {
+        let short = "git reset --hard";
+        let short_message = format_denial_message(
+            short,
+            "destructive",
+            None,
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+        );
+        assert!(
+            short_message.contains(short),
+            "an ordinary command stays copy-pasteable: {short_message}"
+        );
+
+        let huge = "cat > notes.md <<'EOF'\n".to_string() + &"x".repeat(50_000) + "\nEOF\n";
+        let huge_message = format_denial_message(
+            &huge,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("redirect-truncate"),
+            None,
+        );
+
+        assert!(
+            huge_message.len() < short_message.len() + MAX_EXPLAIN_HINT_COMMAND + 500,
+            "reason must stay bounded, got {} bytes for a {} byte command",
+            huge_message.len(),
+            huge.len()
+        );
+        assert!(
+            huge_message.contains("bytes elided"),
+            "truncated reason must report what it dropped: {huge_message}"
+        );
+        // The verdict itself survives truncation.
+        assert!(huge_message.contains("Rule: core.filesystem:redirect-truncate"));
+    }
+
+    /// GH#332: harnesses surface only `permissionDecisionReason` to the model,
+    /// so a minted allow-once code must be named in the reason text itself.
+    #[test]
+    fn test_format_denial_message_names_allow_once_code_when_minted() {
+        let message = format_denial_message(
+            "rm -rf /Users/example/project",
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            Some("137527"),
+        );
+
+        assert!(
+            message.contains("dcg allow-once 137527"),
+            "reason must name the scoped remedy: {message}"
+        );
+        // The scoped remedy stays human-in-the-loop.
+        assert!(
+            message.contains("the user can approve it"),
+            "allow-once line must keep the user in the loop: {message}"
+        );
+    }
+
+    /// GH#332 planted negative: with no code minted, the reason must not
+    /// dangle a nonexistent allow-once remedy.
+    #[test]
+    fn test_format_denial_message_omits_allow_once_when_absent() {
+        let message = format_denial_message(
+            "git reset --hard",
+            "destructive",
+            None,
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+        );
+
+        assert!(
+            !message.contains("allow-once"),
+            "no code minted, so no allow-once mention: {message}"
+        );
     }
 
     /// A hook decision is replayed in the agent transcript on every later
@@ -3628,6 +3796,7 @@ mod tests {
                 None,
                 Some("core.filesystem"),
                 Some("rm-rf"),
+                None,
             ),
             format_review_message(
                 command,
@@ -4949,7 +5118,7 @@ mod tests {
         for (protocol, expected_decision) in cases {
             let mut stdout = FlushProbe::default();
             let mut stderr = FlushProbe::default();
-            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON);
+            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON, false);
 
             assert!(
                 !stdout.bytes.is_empty(),
@@ -4990,6 +5159,63 @@ mod tests {
                 assert_eq!(json["action"], "block");
                 assert_eq!(json["message"], REASON);
             }
+        }
+    }
+
+    /// #338: `general.unverified_decision = "deny"` must convert the
+    /// review-capable protocols' `ask` into an outright denial, so an
+    /// unattended session cannot stall on (or auto-approve) exactly the
+    /// commands dcg declined to inspect. Protocols that already block keep
+    /// blocking, with their reason bytes unchanged.
+    #[test]
+    fn test_write_indeterminate_denies_when_unverified_decision_is_deny() {
+        const REASON: &str = "Command is 126015 bytes and exceeds limit 65536 bytes; \
+            DCG did not evaluate it. Reduce the command size or raise \
+            general.max_command_bytes after review.";
+
+        let cases = [
+            (HookProtocol::ClaudeCompatible, "deny", true),
+            (HookProtocol::Copilot, "deny", true),
+            (HookProtocol::Codex, "deny", false),
+            (HookProtocol::Gemini, "deny", false),
+            (HookProtocol::Hermes, "block", false),
+            (HookProtocol::Grok, "deny", false),
+            (HookProtocol::Antigravity, "block", false),
+        ];
+
+        for (protocol, expected_decision, reason_is_annotated) in cases {
+            let mut stdout = FlushProbe::default();
+            let mut stderr = FlushProbe::default();
+            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON, true);
+
+            let json: serde_json::Value = serde_json::from_slice(&stdout.bytes)
+                .unwrap_or_else(|error| panic!("{protocol:?} output must be JSON: {error}"));
+            let (decision, reason) = match protocol {
+                HookProtocol::ClaudeCompatible | HookProtocol::Codex => {
+                    let specific = &json["hookSpecificOutput"];
+                    (
+                        specific["permissionDecision"].as_str(),
+                        specific["permissionDecisionReason"].as_str(),
+                    )
+                }
+                HookProtocol::Copilot => (
+                    json["permissionDecision"].as_str(),
+                    json["permissionDecisionReason"].as_str(),
+                ),
+                HookProtocol::Gemini
+                | HookProtocol::Hermes
+                | HookProtocol::Grok
+                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+            };
+
+            assert_eq!(decision, Some(expected_decision), "payload: {json}");
+            let reason = reason.unwrap_or_else(|| panic!("{protocol:?} carries no reason"));
+            assert!(reason.starts_with(REASON), "payload: {json}");
+            assert_eq!(
+                reason.contains("unverified_decision"),
+                reason_is_annotated,
+                "only the downgraded ask protocols explain the configured denial: {json}"
+            );
         }
     }
 
